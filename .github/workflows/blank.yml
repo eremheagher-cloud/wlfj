@@ -1,0 +1,691 @@
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: "Número da instância"
+        required: true
+        default: "1"
+
+permissions:
+  contents: write
+
+jobs:
+
+  deploy-rdp:
+
+    runs-on: windows-2022
+
+    timeout-minutes: 360
+
+    steps:
+
+      # ============================================================
+      # 1. PREPARAR WINDOWS
+      # ============================================================
+
+      - name: Prepare Windows
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "========================================"
+          Write-Host "Preparing Windows runner"
+          Write-Host "========================================"
+
+          Write-Host "Computer name:"
+          Write-Host $env:COMPUTERNAME
+
+          Write-Host "Windows version:"
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, OSArchitecture
+
+          Write-Host "Preparation completed."
+
+
+      # ============================================================
+      # 2. CONFIGURAR USUARIO
+      # ============================================================
+
+      - name: Configure RDP User
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $username = "Rafael"
+          $password = "P@ssw0rd!"
+
+          Write-Host "Configuring user: $username"
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingUser) {
+
+            Write-Host "Creating user..."
+
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -FullName $username `
+              -Description "RDP User" `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword `
+              -ErrorAction Stop
+
+          }
+          else {
+
+            Write-Host "User already exists."
+
+            try {
+              Set-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -ErrorAction Stop
+            }
+            catch {
+              Write-Host "Could not reset password."
+            }
+          }
+
+          Write-Host "Adding user to Administrators..."
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Adding user to Remote Desktop Users..."
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP user configuration completed."
+
+
+      # ============================================================
+      # 3. HABILITAR RDP
+      # ============================================================
+
+      - name: Enable Remote Desktop
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "Enabling Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1 `
+            -Force
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Remote Desktop enabled."
+
+
+      # ============================================================
+      # 4. INSTALAR TAILSCALE
+      # ============================================================
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Installing Tailscale..."
+
+          $tailscaleUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $tailscaleUrl `
+            -OutFile $installer
+
+          Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$installer`" /qn /norestart" `
+            -Wait
+
+          Write-Host "Tailscale installation completed."
+
+
+      # ============================================================
+      # 5. CONECTAR TAILSCALE
+      # ============================================================
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $authKey = $env:TAILSCALE_AUTH_KEY
+
+          if ([string]::IsNullOrWhiteSpace($authKey)) {
+            throw "TAILSCALE_AUTH_KEY secret is empty."
+          }
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale executable was not found."
+          }
+
+          $hostname = "enigmano-${{ github.run_id }}"
+
+          Write-Host "Connecting Tailscale..."
+          Write-Host "Hostname: $hostname"
+
+          & $tailscale up `
+            "--authkey=$authKey" `
+            "--hostname=$hostname"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale failed to connect. Exit code: $LASTEXITCODE"
+          }
+
+          Write-Host "Tailscale connected."
+
+          Start-Sleep -Seconds 5
+
+
+      # ============================================================
+      # 6. PEGAR IP TAILSCALE
+      # ============================================================
+
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          Write-Host "Getting Tailscale IP..."
+
+          $ip = & $tailscale ip -4 2>$null |
+            Select-Object -First 1
+
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            Write-Host "Could not obtain Tailscale IPv4."
+          }
+          else {
+            $ip = $ip.Trim()
+
+            Write-Host "Tailscale IPv4:"
+            Write-Host $ip
+
+            "TAILSCALE_IP=$ip" |
+              Out-File `
+                -FilePath $env:GITHUB_ENV `
+                -Append `
+                -Encoding utf8
+          }
+
+
+      # ============================================================
+      # 7. VERIFICAR RDP
+      # ============================================================
+
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "========================================"
+          Write-Host "RDP VERIFICATION"
+          Write-Host "========================================"
+
+          $rdpValue = Get-ItemPropertyValue `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -ErrorAction SilentlyContinue
+
+          if ($rdpValue -eq 0) {
+            Write-Host "RDP is enabled."
+          }
+          else {
+            Write-Host "RDP is disabled."
+          }
+
+          Write-Host ""
+          Write-Host "Checking RDP port..."
+
+          $rdpPort = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if ($null -ne $rdpPort) {
+            Write-Host "RDP port 3389 is listening."
+          }
+          else {
+            Write-Host "RDP port 3389 is not currently listening."
+          }
+
+
+      # ============================================================
+      # 8. PREPARAR GIT
+      # ============================================================
+
+      - name: Prepare PC State
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "Preparing persistent PC state..."
+
+          $stateDirectory = ".pc-state"
+          $stateFile = ".pc-state\state.json"
+
+          if (-not (Test-Path $stateDirectory)) {
+            New-Item `
+              -ItemType Directory `
+              -Path $stateDirectory `
+              -Force | Out-Null
+          }
+
+          if (-not (Test-Path $stateFile)) {
+
+            $initialState = @{
+              applications = @()
+              updated = (Get-Date).ToUniversalTime().ToString("o")
+            }
+
+            $initialState |
+              ConvertTo-Json -Depth 10 |
+              Set-Content `
+                -Path $stateFile `
+                -Encoding UTF8
+
+            Write-Host "Created initial state file."
+          }
+          else {
+            Write-Host "Existing state file found."
+          }
+
+
+      # ============================================================
+      # 9. DETECTAR APLICATIVOS
+      # ============================================================
+
+      - name: Detect User Installed Applications
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "========================================"
+          Write-Host "Detecting installed applications"
+          Write-Host "========================================"
+
+          $applications = @()
+
+          $registryPaths = @(
+            "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+          )
+
+          foreach ($registryPath in $registryPaths) {
+
+            try {
+
+              $items = Get-ItemProperty `
+                -Path $registryPath `
+                -ErrorAction SilentlyContinue
+
+              foreach ($application in $items) {
+
+                if (
+                  -not [string]::IsNullOrWhiteSpace(
+                    [string]$application.DisplayName
+                  )
+                ) {
+
+                  $appName = [string]$application.DisplayName
+                  $appVersion = [string]$application.DisplayVersion
+
+                  $wingetId = ""
+
+                  if (
+                    -not [string]::IsNullOrWhiteSpace($appName) -and
+                    $appName -notmatch "Update|Runtime|Driver|Microsoft Visual C\+\+|Security Update"
+                  ) {
+
+                    try {
+
+                      $wingetOutput = winget list `
+                        --name "$appName" `
+                        --accept-source-agreements `
+                        --disable-interactivity 2>$null
+
+                      foreach ($line in $wingetOutput) {
+
+                        $lineText = [string]$line
+
+                        if (
+                          $lineText -and
+                          $lineText -notmatch "^Name\s+Id\s+Version" -and
+                          $lineText -notmatch "^[-\s]+$" -and
+                          $lineText -match "^\s*(.+?)\s{2,}([A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+)\s{2,}"
+                        ) {
+
+                          $possibleId = $Matches[2]
+
+                          if (
+                            -not [string]::IsNullOrWhiteSpace($possibleId) -and
+                            $possibleId -notmatch "^Version$"
+                          ) {
+                            $wingetId = $possibleId
+                            break
+                          }
+                        }
+                      }
+
+                    }
+                    catch {
+                      Write-Host "WinGet lookup failed for $appName"
+                    }
+                  }
+
+                  $existing = $applications |
+                    Where-Object {
+                      $_.Name -eq $appName
+                    }
+
+                  if ($null -eq $existing) {
+
+                    $applications += [PSCustomObject]@{
+                      Name = $appName
+                      Version = $appVersion
+                      WingetId = $wingetId
+                    }
+                  }
+                }
+              }
+            }
+            catch {
+              Write-Host "Could not read registry path:"
+              Write-Host $registryPath
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Detected applications:"
+
+          foreach ($application in $applications) {
+
+            $appName = [string]$application.Name
+            $appId = [string]$application.WingetId
+
+            Write-Host "$appName | WinGet ID: $appId"
+          }
+
+          Write-Host ""
+          Write-Host "Application detection completed."
+
+          $stateFile = ".pc-state\state.json"
+
+          try {
+
+            if (Test-Path $stateFile) {
+
+              $state = Get-Content `
+                -Path $stateFile `
+                -Raw |
+                ConvertFrom-Json
+
+            }
+            else {
+
+              $state = [PSCustomObject]@{
+                applications = @()
+              }
+            }
+
+            $state.applications = @($applications)
+            $state.updated = (Get-Date).ToUniversalTime().ToString("o")
+
+            $state |
+              ConvertTo-Json -Depth 20 |
+              Set-Content `
+                -Path $stateFile `
+                -Encoding UTF8
+
+            Write-Host "Application state saved locally."
+
+          }
+          catch {
+            Write-Host "Could not update application state."
+            Write-Host $_.Exception.Message
+          }
+
+
+      # ============================================================
+      # 10. SALVAR ESTADO NO REPOSITÓRIO
+      # ============================================================
+
+      - name: Persist PC State in Repository
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "========================================"
+          Write-Host "Saving PC state to repository"
+          Write-Host "========================================"
+
+          if (-not (Test-Path ".pc-state\state.json")) {
+            Write-Host "State file does not exist."
+            exit 0
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add ".pc-state/state.json"
+
+          $changes = git status --porcelain
+
+          if (-not [string]::IsNullOrWhiteSpace($changes)) {
+
+            Write-Host "Changes detected."
+
+            git commit -m "Update PC state"
+
+            if ($LASTEXITCODE -eq 0) {
+
+              git push
+
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "PC state committed and pushed."
+              }
+              else {
+                Write-Host "Git push failed, but the PC session will continue."
+              }
+
+            }
+            else {
+              Write-Host "Git commit failed, but the PC session will continue."
+            }
+
+          }
+          else {
+
+            Write-Host "No state changes detected."
+
+          }
+
+
+      # ============================================================
+      # 11. DETALHES DE CONEXÃO
+      # ============================================================
+
+      - name: Connection Details
+        shell: powershell
+        run: |
+          Write-Host "========================================"
+          Write-Host "CONNECTION DETAILS"
+          Write-Host "========================================"
+
+          Write-Host "PC is ready for RDP."
+          Write-Host "Username: Rafael"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "RDP Port: 3389"
+
+          Write-Host ""
+          Write-Host "The session will remain active."
+          Write-Host "GitHub Actions maximum job time: 360 minutes."
+
+
+      # ============================================================
+      # 12. MANTER O RUNNER ATIVO
+      # ============================================================
+
+      - name: Keep Session Alive
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "========================================"
+          Write-Host "SESSION ACTIVE"
+          Write-Host "PC is ready for RDP"
+          Write-Host "Keep-alive started"
+          Write-Host "========================================"
+
+          while ($true) {
+
+            try {
+
+              $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+              Write-Host "[$now] PC is still running."
+
+              # ----------------------------------------------------
+              # Verificar Tailscale
+              # ----------------------------------------------------
+
+              $tailscaleService = Get-Service `
+                -Name "Tailscale" `
+                -ErrorAction SilentlyContinue
+
+              if ($null -ne $tailscaleService) {
+
+                if ($tailscaleService.Status -ne "Running") {
+
+                  Write-Host "Tailscale service is stopped. Starting it..." `
+                    -ForegroundColor Yellow
+
+                  try {
+
+                    Start-Service `
+                      -Name "Tailscale" `
+                      -ErrorAction SilentlyContinue
+
+                    Write-Host "Tailscale service start requested."
+
+                  }
+                  catch {
+
+                    Write-Host "Could not start Tailscale service." `
+                      -ForegroundColor Yellow
+                  }
+
+                }
+                else {
+
+                  Write-Host "Tailscale service is running."
+
+                }
+              }
+
+              # ----------------------------------------------------
+              # Verificar RDP
+              # ----------------------------------------------------
+
+              $rdpValue = Get-ItemPropertyValue `
+                -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+                -Name "fDenyTSConnections" `
+                -ErrorAction SilentlyContinue
+
+              if ($rdpValue -eq 0) {
+
+                Write-Host "RDP is enabled."
+
+              }
+              else {
+
+                Write-Host "RDP is disabled. Re-enabling..." `
+                  -ForegroundColor Yellow
+
+                Set-ItemProperty `
+                  -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+                  -Name "fDenyTSConnections" `
+                  -Value 0 `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+                Enable-NetFirewallRule `
+                  -DisplayGroup "Remote Desktop" `
+                  -ErrorAction SilentlyContinue
+              }
+
+              # ----------------------------------------------------
+              # Verificar porta RDP
+              # ----------------------------------------------------
+
+              $rdpPort = Get-NetTCPConnection `
+                -LocalPort 3389 `
+                -State Listen `
+                -ErrorAction SilentlyContinue
+
+              if ($null -ne $rdpPort) {
+
+                Write-Host "RDP port 3389 is listening."
+
+              }
+              else {
+
+                Write-Host "RDP port 3389 is not listening." `
+                  -ForegroundColor Yellow
+              }
+
+              # ----------------------------------------------------
+              # Esperar antes da próxima verificação
+              # ----------------------------------------------------
+
+              Start-Sleep -Seconds 30
+
+            }
+            catch {
+
+              Write-Host "Keep-alive check failed." `
+                -ForegroundColor Yellow
+
+              Write-Host $_.Exception.Message `
+                -ForegroundColor Yellow
+
+              Write-Host "The keep-alive loop will continue."
+
+              Start-Sleep -Seconds 10
+            }
+          }
